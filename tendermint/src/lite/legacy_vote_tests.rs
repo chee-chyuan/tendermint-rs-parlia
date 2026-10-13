@@ -1,5 +1,5 @@
 //! Regression tests for legacy per-entry vote commitments (SRC-1704).
-use super::{TmHeaderVerifier, Validator};
+use super::{SignerLookup, TmHeaderVerifier, Validator};
 use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signer};
 use prost_amino::Message;
 use sha2::{Digest, Sha256};
@@ -158,6 +158,21 @@ fn stray_blocks() -> Vec<Option<BlockId>> {
     ]
 }
 
+// The vote checks and tally are shared by the slot (untrusted set) and address (trusted set)
+// lookups.
+fn assert_overlap(
+    header: &SignedHeader,
+    validators: &Vec<Validator>,
+    expected: Result<(), &'static str>,
+) {
+    for lookup in [SignerLookup::Slot, SignerLookup::Address].iter().copied() {
+        assert_eq!(
+            TmHeaderVerifier::verify_sufficient_validators_overlap(header, validators, lookup),
+            expected
+        );
+    }
+}
+
 #[test]
 fn valid_stray_votes_do_not_prevent_a_quorum() {
     for stray in stray_blocks() {
@@ -167,10 +182,7 @@ fn valid_stray_votes_do_not_prevent_a_quorum() {
             Some(block_id()),
             stray,
         ]);
-        assert_eq!(
-            TmHeaderVerifier::verify_sufficient_validators_overlap(&header, &validators),
-            Ok(())
-        );
+        assert_overlap(&header, &validators, Ok(()));
     }
 }
 
@@ -183,10 +195,7 @@ fn only_matching_block_ids_contribute_to_quorum() {
             stray.clone(),
             stray,
         ]);
-        assert_eq!(
-            TmHeaderVerifier::verify_sufficient_validators_overlap(&header, &validators),
-            Err("No enough voting power")
-        );
+        assert_overlap(&header, &validators, Err("No enough voting power"));
     }
 }
 
@@ -199,8 +208,5 @@ fn invalid_stray_signature_is_rejected_even_with_a_quorum() {
         None,
     ]);
     header.commit.as_mut().unwrap().signatures[3].signature = vec![0; 64];
-    assert_eq!(
-        TmHeaderVerifier::verify_sufficient_validators_overlap(&header, &validators),
-        Err("Invalid commit signature")
-    );
+    assert_overlap(&header, &validators, Err("Invalid commit signature"));
 }
