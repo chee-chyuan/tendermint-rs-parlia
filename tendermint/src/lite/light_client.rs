@@ -312,7 +312,9 @@ impl TmHeaderVerifier {
         let mut fields_bytes: Vec<Vec<u8>> = Vec::with_capacity(14);
         fields_bytes.push({
             let mut wire = Vec::new();
-            header.version.as_ref().unwrap().encode(&mut wire).unwrap();
+            // Go's Header.Version is a value, so an omitted message means the
+            // zero consensus version. Hash that value rather than rejecting it.
+            header.version.clone().unwrap_or_default().encode(&mut wire).unwrap();
             wire
         });
         fields_bytes.push({
@@ -787,3 +789,7 @@ mod test {
 #[cfg(test)]
 #[path = "legacy_vote_tests.rs"]
 mod legacy_vote_tests;
+
+#[cfg(test)]
+#[path = "legacy_header_tests.rs"]
+mod legacy_header_tests;
