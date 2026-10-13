@@ -51,6 +51,17 @@ struct HeaderCs {
     header: LightBlock,
 }
 
+/// How a commit signature is matched to the validator that signed it.
+#[derive(Clone, Copy)]
+enum SignerLookup {
+    /// Signature i belongs to validator i of the set the commit is for (go-tendermint
+    /// `VerifyCommit`).
+    Slot,
+    /// Match `CommitSig.validator_address` against the address derived from each public key
+    /// (go-tendermint `VerifyFutureCommit` counting the old validator set).
+    Address,
+}
+
 impl ConsensusState {
     pub fn encode(self) -> Result<Vec<u8>, &'static str> {
         let validator_set_size: usize = self.next_validator_set.len();
@@ -152,6 +163,7 @@ impl TmHeaderVerifier {
             TmHeaderVerifier::verify_sufficient_validators_overlap(
                 &header.signed_header.as_ref().unwrap(),
                 &cs.next_validator_set,
+                SignerLookup::Address,
             )?;
         }
 
@@ -474,9 +486,10 @@ impl TmHeaderVerifier {
         signed_header: &SignedHeader,
         validators: &ValidatorSet,
     ) -> Result<(), &'static str> {
-        TmHeaderVerifier::valid_commit_basic(signed_header, validators)?;
-        TmHeaderVerifier::validate_commit_full(signed_header, validators)?;
-        Ok(())
+        // Signatures are bound to validators by slot in verify_sufficient_signers_overlap. The
+        // addresses carried by the validator set and by each CommitSig are neither hashed nor
+        // signed, so go-tendermint never checks them against each other here.
+        TmHeaderVerifier::valid_commit_basic(signed_header, validators)
     }
 
     fn valid_commit_basic(
@@ -489,29 +502,6 @@ impl TmHeaderVerifier {
         if signatures.len() != validator_set.validators.len() {
             return Err("pre-commit length doesn't match validator length");
         }
-        Ok(())
-    }
-
-    fn validate_commit_full(
-        signed_header: &SignedHeader,
-        validator_set: &ValidatorSet,
-    ) -> Result<(), &'static str> {
-        for commit_sig in signed_header.commit.as_ref().unwrap().signatures.iter() {
-            let validator_address = &commit_sig.validator_address;
-            if validator_address.is_empty() {
-                continue;
-            }
-            if validator_set
-                .validators
-                .iter()
-                .find(|val| &val.address == validator_address)
-                .cloned()
-                == None
-            {
-                return Err("Found a faulty signer not present in the validator set ");
-            }
-        }
-
         Ok(())
     }
 
@@ -529,9 +519,12 @@ impl TmHeaderVerifier {
                 voting_power: v.voting_power as u64,
             })
         }
+        // The commit is for this validator set, so signature i belongs to validator i, as in
+        // go-tendermint's VerifyCommit.
         TmHeaderVerifier::verify_sufficient_validators_overlap(
             &untrusted_sh.signed_header.as_ref().unwrap(),
             &vals,
+            SignerLookup::Slot,
         )?;
         Ok(())
     }
@@ -539,41 +532,54 @@ impl TmHeaderVerifier {
     fn verify_sufficient_validators_overlap(
         signed_header: &SignedHeader,
         validator_set: &Vec<Validator>,
+        lookup: SignerLookup,
     ) -> Result<(), &'static str> {
         let signatures = &signed_header.commit.as_ref().unwrap().signatures;
         let chain_id = signed_header.header.as_ref().unwrap().chain_id.to_string();
 
         let mut tallied_voting_power = 0_u64;
         let mut seen_validators = HashSet::new();
-        let non_absent_votes = signatures.iter().enumerate().flat_map(|(_, signature)| {
-            if let Some(vote) = TmHeaderVerifier::non_absent_vote(signature, chain_id.clone()) {
-                Some((signature, vote))
-            } else {
-                None
-            }
-        });
+        let non_absent_votes = signatures
+            .iter()
+            .enumerate()
+            .flat_map(|(index, signature)| {
+                if let Some(vote) = TmHeaderVerifier::non_absent_vote(signature, chain_id.clone()) {
+                    Some((index, signature, vote))
+                } else {
+                    None
+                }
+            });
 
-        for (signature, vote) in non_absent_votes {
-            // Ensure we only count a validator's power once
-            let addr_id: AccountId = signature.validator_address.clone().try_into().unwrap();
-            if !seen_validators.contains(&addr_id) {
-                seen_validators.insert(addr_id);
-            } else {
-                return Err("Duplicate Validator");
-            }
+        for (index, signature, vote) in non_absent_votes {
+            let validator = match lookup {
+                SignerLookup::Slot => match validator_set.get(index) {
+                    Some(validator) => validator.clone(),
+                    None => return Err("pre-commit length doesn't match validator length"),
+                },
+                SignerLookup::Address => {
+                    // Ensure we only count a validator's power once
+                    let addr_id: AccountId =
+                        signature.validator_address.clone().try_into().unwrap();
+                    if !seen_validators.contains(&addr_id) {
+                        seen_validators.insert(addr_id);
+                    } else {
+                        return Err("Duplicate Validator");
+                    }
 
-            let validator = match validator_set
-                .iter()
-                .find(|val| {
-                    let digest = Sha256::digest(&val.pub_key);
-                    let mut hash_bytes = [0u8; SHA256_HASH_SIZE];
-                    hash_bytes.copy_from_slice(&digest);
-                    hash_bytes[..20].to_vec() == signature.validator_address.clone()
-                })
-                .cloned()
-            {
-                Some(validator) => validator,
-                None => continue, // Cannot find matching validator, so we skip the vote
+                    match validator_set
+                        .iter()
+                        .find(|val| {
+                            let digest = Sha256::digest(&val.pub_key);
+                            let mut hash_bytes = [0u8; SHA256_HASH_SIZE];
+                            hash_bytes.copy_from_slice(&digest);
+                            hash_bytes[..20].to_vec() == signature.validator_address.clone()
+                        })
+                        .cloned()
+                    {
+                        Some(validator) => validator,
+                        None => continue, // Cannot find matching validator, so we skip the vote
+                    }
+                }
             };
 
             // Check vote is valid
@@ -781,6 +787,62 @@ mod test {
         let input1 =hex::decode("76080211e305fc030000000022480a207eaabf7df1081377e06e08efe7ad17974049380bdd65a9b053c099ef80ff6e6f12240a20d153cc308d9cb96ca43ffeceaae1ee85794c83d17408ff76cfee92f5e91d0be210012a0b08e291aef20510cebfe23e321242696e616e63652d436861696e2d4e696c65").unwrap();
         let vote: CanonicalVote = CanonicalVote::decode_length_delimited(&input1[..]).unwrap();
         println!("{:?}", vote);
+    }
+
+    // One-validator adjacent-height header: trusted height 1, chain "validator-address".
+    const VALIDATOR_ADDRESS_INPUT: &str = "000000000000000000000000000000000000000000000000000000000000045d000000000000000000000000000000000000000000000000000000000000009076616c696461746f722d6164647265737300000000000000000000000000000000000000000000014141414141414141414141414141414141414141414141414141414141414141406e4bff51ac3932e117afc580452394caa456a6c412fd79728418e9e2fddeac06154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c000000000000000aab070a9e050a97030a02080a121176616c696461746f722d616464726573731802220b0880e2cfaa0610c0a9d33a3a480a2011111111111111111111111111111111111111111111111111111111111111111224080112201212121212121212121212121212121212121212121212121212121212121212422021212121212121212121212121212121212121212121212121212121212121214a2022222222222222222222222222222222222222222222222222222222222222225220406e4bff51ac3932e117afc580452394caa456a6c412fd79728418e9e2fddeac5a20406e4bff51ac3932e117afc580452394caa456a6c412fd79728418e9e2fddeac622023232323232323232323232323232323232323232323232323232323232323236a202424242424242424242424242424242424242424242424242424242424242424722025252525252525252525252525252525252525252525252525252525252525257a202626262626262626262626262626262626262626262626262626262626262626820114ef1d1070c92e611e7f74225aa95e7037ab00e27a1281020a480a20ed72e75273770da917cec0d78956c6e4ebb234f72a4cd689098c73aec9afdba2122408011220313131313131313131313131313131313131313131313131313131313131313112b4010802100222480a20ed72e75273770da917cec0d78956c6e4ebb234f72a4cd689098c73aec9afdba212240801122031313131313131313131313131313131313131313131313131313131313131312a0c0881e2cfaa06108084b8d9013214ef1d1070c92e611e7f74225aa95e7037ab00e27a42407dc4af39bb926765dc346b4c2bc35071034e37ba8b7dbe282a42d77868a09ebe1ddc40c7f5e9073c7a982f1fdfa217e7600624ce3e1ddcb5567b664dc120e4021282010a3f0a14ef1d1070c92e611e7f74225aa95e7037ab00e27a12251624de642006154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c180a123f0a14ef1d1070c92e611e7f74225aa95e7037ab00e27a12251624de642006154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c180a1a82010a3f0a14ef1d1070c92e611e7f74225aa95e7037ab00e27a12251624de642006154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c180a123f0a14ef1d1070c92e611e7f74225aa95e7037ab00e27a12251624de642006154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c180a";
+    // sha256(pub_key)[..20], i.e. the canonical address of the only validator.
+    const CANONICAL_ADDRESS: &str = "ef1d1070c92e611e7f74225aa95e7037ab00e27a";
+    // Offsets into VALIDATOR_ADDRESS_INPUT.
+    const COMMIT_SIG_ADDRESS_AT: usize = 797;
+    const COMMIT_SIG_SIGNATURE_AT: usize = 819;
+    const VALIDATOR_SET_ADDRESS_AT: usize = 890;
+
+    fn execute_hex(input: &[u8]) -> Result<String, &'static str> {
+        let mut data = vec![];
+        TmHeaderVerifier::execute(input, &mut BytesRef::Flexible(&mut data))?;
+        Ok(hex::encode(&data))
+    }
+
+    fn with_address(mut input: Vec<u8>, at: usize, byte: u8) -> Vec<u8> {
+        assert_eq!(hex::encode(&input[at..at + 20]), CANONICAL_ADDRESS);
+        input[at..at + 20].copy_from_slice(&[byte; 20]);
+        input
+    }
+
+    #[test]
+    fn test_validator_set_address_is_not_checked() {
+        use sha2::{Digest, Sha256};
+
+        let control = hex::decode(VALIDATOR_ADDRESS_INPUT).unwrap();
+        let candidate = with_address(control.clone(), VALIDATOR_SET_ADDRESS_AT, 0x43);
+        // Byte-identical to the input attached to the report.
+        assert_eq!(
+            hex::encode(Sha256::digest(&candidate)),
+            "57ec1656877a2ac78b3d0ebf986693953f84f368865c5041123911967e50c1af"
+        );
+
+        let expected = execute_hex(&control).unwrap();
+        assert_eq!(execute_hex(&candidate), Ok(expected));
+    }
+
+    #[test]
+    fn test_commit_sig_address_is_not_signed() {
+        let control = hex::decode(VALIDATOR_ADDRESS_INPUT).unwrap();
+        let expected = execute_hex(&control).unwrap();
+
+        let commit_sig_only = with_address(control.clone(), COMMIT_SIG_ADDRESS_AT, 0x44);
+        assert_eq!(execute_hex(&commit_sig_only), Ok(expected.clone()));
+
+        let both = with_address(commit_sig_only, VALIDATOR_SET_ADDRESS_AT, 0x44);
+        assert_eq!(execute_hex(&both), Ok(expected));
+    }
+
+    #[test]
+    fn test_slot_signature_is_still_verified() {
+        let mut input = hex::decode(VALIDATOR_ADDRESS_INPUT).unwrap();
+        input[COMMIT_SIG_SIGNATURE_AT] ^= 1;
+        assert_eq!(execute_hex(&input), Err("Invalid commit signature"));
     }
 }
 
