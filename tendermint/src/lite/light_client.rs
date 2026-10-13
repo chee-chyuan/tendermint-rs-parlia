@@ -12,7 +12,7 @@ use prost_amino::Message as _;
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, convert::TryInto};
 use tendermint_proto::crypto::{
-    CanonicalBlockId, CanonicalPartSetHeader, CanonicalVote as RawCanonicalVote, Commit, CommitSig,
+    CanonicalBlockId, CanonicalPartSetHeader, CanonicalVote as RawCanonicalVote, CommitSig,
     LightBlock, SignedHeader, ValidatorSet,
 };
 
@@ -546,11 +546,7 @@ impl TmHeaderVerifier {
         let mut tallied_voting_power = 0_u64;
         let mut seen_validators = HashSet::new();
         let non_absent_votes = signatures.iter().enumerate().flat_map(|(_, signature)| {
-            if let Some(vote) = TmHeaderVerifier::non_absent_vote(
-                signature,
-                chain_id.clone(),
-                &signed_header.commit.as_ref().unwrap(),
-            ) {
+            if let Some(vote) = TmHeaderVerifier::non_absent_vote(signature, chain_id.clone()) {
                 Some((signature, vote))
             } else {
                 None
@@ -592,10 +588,14 @@ impl TmHeaderVerifier {
                 )
                 .is_err()
             {
-                continue;
+                return Err("Invalid commit signature");
             }
 
-            tallied_voting_power += validator.voting_power;
+            // Valid stray precommits (including nil votes) measure availability,
+            // but only votes for the committed BlockID contribute to its quorum.
+            if signature.block_id == signed_header.commit.as_ref().unwrap().block_id {
+                tallied_voting_power += validator.voting_power;
+            }
         }
 
         let total_voting_power = validator_set
@@ -609,33 +609,38 @@ impl TmHeaderVerifier {
         Ok(())
     }
 
-    fn non_absent_vote(
-        commit_sig: &CommitSig,
-        chain_id: String,
-        commit: &Commit,
-    ) -> Option<RawCanonicalVote> {
+    fn non_absent_vote(commit_sig: &CommitSig, chain_id: String) -> Option<RawCanonicalVote> {
         if commit_sig.vote_type != 2 {
             return None;
         }
-        let timestamp = &commit_sig.timestamp;
-        let block_id = &commit.block_id.as_ref().unwrap();
-        let mut h = [0u8; SHA256_HASH_SIZE];
-        h.copy_from_slice(&block_id.hash.as_slice());
-        let mut ph = [0u8; SHA256_HASH_SIZE];
-        ph.copy_from_slice(&block_id.part_set_header.as_ref().unwrap().hash.as_slice());
-        let p = CanonicalPartSetHeader {
-            total: block_id.part_set_header.as_ref().unwrap().total,
-            hash: ph.to_vec(),
+        // Legacy CommitSig carries its own BlockID. The outer commit identifies
+        // the quorum's block, not necessarily the block this validator signed.
+        // Amino omits Go's zero-value nested structs. Normalize absent and
+        // explicitly empty BlockIDs to the same nil-vote signing bytes.
+        let block_id = commit_sig.block_id.clone().unwrap_or_default();
+        let parts = block_id.part_set_header.unwrap_or_default();
+        let canonical_parts = if parts.total == 0 && parts.hash.is_empty() {
+            None
+        } else {
+            Some(CanonicalPartSetHeader {
+                total: parts.total,
+                hash: parts.hash,
+            })
+        };
+        let canonical_block = if block_id.hash.is_empty() && canonical_parts.is_none() {
+            None
+        } else {
+            Some(CanonicalBlockId {
+                hash: block_id.hash,
+                part_set_header: canonical_parts,
+            })
         };
         Some(RawCanonicalVote {
             signed_msg_type: commit_sig.vote_type,
             height: commit_sig.height,
             round: commit_sig.round as i64,
-            block_id: Some(CanonicalBlockId {
-                hash: h.to_vec(),
-                part_set_header: Some(p),
-            }),
-            timestamp: timestamp.clone(),
+            block_id: canonical_block,
+            timestamp: commit_sig.timestamp.clone(),
             chain_id,
         })
     }
@@ -778,3 +783,7 @@ mod test {
         println!("{:?}", vote);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_vote_tests.rs"]
+mod legacy_vote_tests;
