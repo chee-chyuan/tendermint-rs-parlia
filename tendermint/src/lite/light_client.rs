@@ -26,6 +26,8 @@ const VALIDATOR_SET_HASH_LENGTH: usize = 32;
 const APP_HASH_LENGTH: usize = 32;
 const VALIDATOR_PUBKEY_LENGTH: usize = 32;
 const VALIDATOR_VOTING_POWER_LENGTH: usize = 8;
+// go-tendermint `types.MaxTotalVotingPower`.
+const MAX_TOTAL_VOTING_POWER: i64 = i64::MAX / 8;
 const MAX_CONSENSUS_STATE_LENGTH: usize = 32 * (128 - 1);
 
 #[derive(
@@ -543,7 +545,9 @@ impl TmHeaderVerifier {
         let signatures = &signed_header.commit.as_ref().unwrap().signatures;
         let chain_id = signed_header.header.as_ref().unwrap().chain_id.to_string();
 
-        let mut tallied_voting_power = 0_u64;
+        // Voting power is a signed int64 in the Go client; `Validator::voting_power` holds the same
+        // bits as u64. Tally in i64 with Go's wrapping `+=` so the quorum check matches go-bsc.
+        let mut tallied_voting_power = 0_i64;
         let mut seen_validators = HashSet::new();
         let non_absent_votes = signatures.iter().enumerate().flat_map(|(_, signature)| {
             if let Some(vote) = TmHeaderVerifier::non_absent_vote(
@@ -595,14 +599,31 @@ impl TmHeaderVerifier {
                 continue;
             }
 
-            tallied_voting_power += validator.voting_power;
+            tallied_voting_power = tallied_voting_power.wrapping_add(validator.voting_power as i64);
         }
 
-        let total_voting_power = validator_set
-            .iter()
-            .fold(0u64, |total, val_info| total + val_info.voting_power);
+        TmHeaderVerifier::verify_voting_power_quorum(tallied_voting_power, validator_set)
+    }
 
-        if tallied_voting_power * 3 <= total_voting_power * 2 {
+    /// Two-thirds quorum check with the integer semantics of go-tendermint v0.31
+    /// `ValidatorSet.VerifyCommit` / `VerifyFutureCommit`, which go-bsc uses for this precompile.
+    /// The total is a saturating (`safeAddClip`) int64 sum that must not exceed
+    /// `MAX_TOTAL_VOTING_POWER` at any step (go panics there, and the precompile recovers it into
+    /// an error). The commit passes iff `tallied > total*2/3`, where `*` wraps and `/` truncates
+    /// toward zero, as in Go.
+    fn verify_voting_power_quorum(
+        tallied_voting_power: i64,
+        validator_set: &[Validator],
+    ) -> Result<(), &'static str> {
+        let mut total_voting_power = 0_i64;
+        for validator in validator_set {
+            total_voting_power = total_voting_power.saturating_add(validator.voting_power as i64);
+            if total_voting_power > MAX_TOTAL_VOTING_POWER {
+                return Err("Total voting power exceeds the limit");
+            }
+        }
+
+        if tallied_voting_power <= total_voting_power.wrapping_mul(2) / 3 {
             return Err("No enough voting power");
         }
 
@@ -735,7 +756,7 @@ impl TmHeaderVerifier {
 
 #[cfg(test)]
 mod test {
-    use crate::lite::light_client::TmHeaderVerifier;
+    use crate::lite::light_client::{TmHeaderVerifier, Validator, MAX_TOTAL_VOTING_POWER};
     use parity_bytes::BytesRef;
     use prost_amino::Message as _;
 
@@ -765,6 +786,56 @@ mod test {
         // assert_eq!(res,"01010000000000000000000000000000000000000000000000000000000000e042696e616e63652d436861696e2d47616e67657300000000000000000000000000000000000f2be707434a1b213c078ef70e4fc08ff009918637f1ea45a83dfd15532c8d3022846b1f3afc06a1aec5ae1efbd9081437bd3b4af39d80e1a8cb087a0c04d80e2f27ed4d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f60000000e8d4a5100099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d3000000e8d4a5100001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a612000000e8d4a51000");
         assert_eq!(res,"010000000000000000000000000000000000000000000000000000000000010842696e616e63652d436861696e2d47616e67657300000000000000000000000000000000000f2be707434a1b213c078ef70e4fc08ff009918637f1ea45a83dfd15532c8d3022846b1f3afc06a1aec5ae1efbd9081437bd3b4af39d80e1a8cb087a0c04d80e2f27ed8f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d53000000e8d4a510004d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f60000000e8d4a5100099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d3000000e8d4a5100001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a612000000e8d4a51000");
     }
+
+    fn validators(powers: &[i64]) -> Vec<Validator> {
+        powers
+            .iter()
+            .map(|power| Validator {
+                pub_key: vec![0u8; 32],
+                voting_power: *power as u64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_voting_power_quorum_matches_go() {
+        let quorum = |tallied: i64, powers: &[i64]| {
+            TmHeaderVerifier::verify_voting_power_quorum(tallied, &validators(powers))
+        };
+        let no_quorum = Err("No enough voting power");
+        let over_limit = Err("Total voting power exceeds the limit");
+
+        // Ordinary sets: tallied must be strictly more than two thirds.
+        assert!(quorum(21, &[10, 10, 10]).is_ok());
+        assert_eq!(quorum(20, &[10, 10, 10]), no_quorum);
+
+        // A single validator with power MinInt64+1 used to wrap the u64 quorum product and pass.
+        // In Go, total*2 wraps to 2, 2/3 == 0 and the negative tally is not above it.
+        assert_eq!(quorum(i64::MIN + 1, &[i64::MIN + 1]), no_quorum);
+
+        // Go panics (recovered into an error) once any prefix of the total exceeds
+        // MaxTotalVotingPower, even when the set is positive and has a real quorum.
+        assert_eq!(quorum(1 << 61, &[1 << 61]), over_limit);
+        assert_eq!(quorum(1 << 61, &[1 << 61, -(1 << 61)]), over_limit);
+        assert!(quorum(MAX_TOTAL_VOTING_POWER, &[MAX_TOTAL_VOTING_POWER]).is_ok());
+
+        // Go accepts some sets containing negative power: total 5, 5*2/3 == 3, 10 > 3.
+        assert!(quorum(10, &[10, -5]).is_ok());
+        // Go's division truncates toward zero: total -1, -2/3 == 0, so a zero tally fails.
+        assert_eq!(quorum(0, &[-1]), no_quorum);
+        assert!(quorum(1, &[-1]).is_ok());
+    }
+
+    #[test]
+    fn test_negative_voting_power_commit_rejected() {
+        // One genuine signature from a validator with voting power MinInt64+1.
+        let input = hex::decode("000000000000000000000000000000000000000000000000000000000000047e00000000000000000000000000000000000000000000000000000000000000906e656761746976652d706f77657200000000000000000000000000000000000000000000000000014141414141414141414141414141414141414141414141414141414141414141d4789cb15f48301c04d1a4d612d84f077098d9af918214ef466395314edfb4ad337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d98000000000000001cc070a9b050a94030a02080a120e6e656761746976652d706f7765721802220b0880e2cfaa0610c0a9d33a3a480a2011111111111111111111111111111111111111111111111111111111111111111224080112201212121212121212121212121212121212121212121212121212121212121212422021212121212121212121212121212121212121212121212121212121212121214a2022222222222222222222222222222222222222222222222222222222222222225220d4789cb15f48301c04d1a4d612d84f077098d9af918214ef466395314edfb4ad5a20d4789cb15f48301c04d1a4d612d84f077098d9af918214ef466395314edfb4ad622023232323232323232323232323232323232323232323232323232323232323236a202424242424242424242424242424242424242424242424242424242424242424722025252525252525252525252525252525252525252525252525252525252525257a20262626262626262626262626262626262626262626262626262626262626262682011403d316adf68403b37ba6d766b08516b828ceedf81281020a480a209f74181f2a0a5fbae7a20b6b70add4e7ad81c6891efdaed13ca88faa64e8a470122408011220313131313131313131313131313131313131313131313131313131313131313112b4010802100222480a209f74181f2a0a5fbae7a20b6b70add4e7ad81c6891efdaed13ca88faa64e8a47012240801122031313131313131313131313131313131313131313131313131313131313131312a0c0881e2cfaa06108084b8d901321403d316adf68403b37ba6d766b08516b828ceedf842403e268e276ad65757475a164be37ecff3dd5325316e7dd05af4dd0c3c8ddd8048c13c3a311b84df7a0a58d3271c60dd5543d999c614e5048dc56a61b3aa87e6011294010a480a1403d316adf68403b37ba6d766b08516b828ceedf812251624de6420337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d9188180808080808080800112480a1403d316adf68403b37ba6d766b08516b828ceedf812251624de6420337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d918818080808080808080011a94010a480a1403d316adf68403b37ba6d766b08516b828ceedf812251624de6420337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d9188180808080808080800112480a1403d316adf68403b37ba6d766b08516b828ceedf812251624de6420337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d91881808080808080808001").unwrap();
+
+        let mut data = vec![];
+        let res = TmHeaderVerifier::execute(&input[..], &mut BytesRef::Flexible(&mut data));
+        assert_eq!(res, Err("No enough voting power"));
+    }
+
     #[test]
     fn test_decode_encode() {
         let input = hex::decode("4e0a1f0a141203616263220b088cca9f800610b8d48766306412070a050a0301020312290a2712251624de642001010101010101010101010101010101010101010101010101010101010101011a00").unwrap();
