@@ -383,6 +383,39 @@ pub struct CommitmentProofOp {
     pub proof: CommitmentProof,
 }
 
+// Match encoding/binary.ReadVarint on 64-bit Go, including non-minimal
+// encodings. IAVL rejects negative values after decoding the signed varint.
+fn skip_nonnegative_go_varint(mut input: &[u8]) -> Option<&[u8]> {
+    let mut value = 0u64;
+    for index in 0..10 {
+        let (&byte, rest) = input.split_first()?;
+        input = rest;
+        if index == 9 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte < 0x80 {
+            return if value & 1 == 0 { Some(input) } else { None };
+        }
+    }
+    None
+}
+
+fn valid_iavl_leaf_prefix(prefix: &[u8]) -> bool {
+    let Some((&0, mut remaining)) = prefix.split_first() else {
+        return false;
+    };
+    // BNB's ICS23 fork requires two nonnegative signed varints after the
+    // height byte, with no leftover bytes for a leaf (ops.go: z(op, 0)).
+    for _ in 0..2 {
+        let Some(rest) = skip_nonnegative_go_varint(remaining) else {
+            return false;
+        };
+        remaining = rest;
+    }
+    remaining.is_empty()
+}
+
 impl ProofExecute for CommitmentProofOp {
     fn run(&self, value: Vec<u8>, key: Vec<u8>) -> Result<Hash, &'static str> {
         let spec = match self.field_type.as_str() {
@@ -398,6 +431,13 @@ impl ProofExecute for CommitmentProofOp {
             },
             None => return Err("invalid merkle proof"),
         };
+
+        if self.field_type == "ics23:iavl" {
+            let leaf = existence.leaf.as_ref().ok_or("missing IAVL leaf op")?;
+            if !valid_iavl_leaf_prefix(&leaf.prefix) {
+                return Err("invalid IAVL leaf prefix");
+            }
+        }
 
         let root = match calculate_existence_root(&existence) {
             Ok(r) => r,
@@ -683,3 +723,7 @@ mod test {
 #[cfg(test)]
 #[path = "iavl_key_tests.rs"]
 mod iavl_key_tests;
+
+#[cfg(test)]
+#[path = "iavl_leaf_tests.rs"]
+mod iavl_leaf_tests;
